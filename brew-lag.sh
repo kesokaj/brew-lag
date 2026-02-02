@@ -28,7 +28,8 @@ usage() {
     echo "Commands:"
     echo "  plan          (default) Analyze and generate a plan."
     echo "  apply         Execute the saved plan."
-    echo "  install <pkg> Check or fix a single package."
+    echo "  install <pkg> Install or fix a package to its lagged version."
+    echo "  upgrade-excluded  Upgrade all excluded packages to latest."
     echo "  exclude <pkg> Add a package to the exception list (keep at latest)."
     echo "  include <pkg> Remove a package from exceptions (enforce lag)."
     echo "  list          List all excluded packages."
@@ -91,6 +92,37 @@ list_exceptions() {
     else
         echo "  (none)"
     fi
+    exit 0
+}
+
+upgrade_excluded() {
+    init_config
+    
+    if [ ! -s "$EXCEPTIONS_FILE" ]; then
+        log "No excluded packages to upgrade."
+        exit 0
+    fi
+    
+    local pkgs=$(cat "$EXCEPTIONS_FILE" | tr '\n' ' ')
+    log "Upgrading excluded packages: $pkgs"
+    
+    # Unpin
+    log "Unpinning..."
+    brew unpin $pkgs </dev/null 2>/dev/null || true
+    
+    # Upgrade
+    log "Upgrading..."
+    if brew upgrade $pkgs </dev/null; then
+        success "Upgrade complete."
+    else
+        warn "Some packages may have failed to upgrade."
+    fi
+    
+    # Re-pin
+    log "Re-pinning..."
+    brew pin $pkgs </dev/null 2>/dev/null || true
+    
+    success "Done."
     exit 0
 }
 
@@ -323,9 +355,10 @@ execute_plan() {
         local tap_rb="$TAP_PATH/Formula/$formula.rb"
         git -C "$BREW_REPO" show "$hash:$path" > "$tap_rb"
         
-        # Must uninstall to switch from homebrew/core to local tap
+        # Must unpin first, then uninstall to switch from homebrew/core to local tap
         # We ignore dependencies to avoid breaking the world, assuming ABI compatibility or rebuild needs
-        brew uninstall --ignore-dependencies "$formula" < /dev/null &>/dev/null || true
+        brew unpin "$formula" </dev/null &>/dev/null || true
+        brew uninstall --ignore-dependencies "$formula" </dev/null &>/dev/null || true
         
         # Install from local tap
         # We use --ignore-dependencies to ensure we don't fail just because a dependency is pinned
@@ -356,10 +389,13 @@ check_single_package() {
     BREW_REPO=$(brew --repository homebrew/core)
     
     # Check if installed
-    local current_ver=$(brew info --json=v1 "$pkg" | jq -r '.[0].installed[-1].version')
+    local current_ver=$(brew info --json=v1 "$pkg" 2>/dev/null | jq -r '.[0].installed[-1].version' 2>/dev/null)
+    local is_new_install=false
+    
     if [ -z "$current_ver" ] || [ "$current_ver" == "null" ]; then
-        error "Package '$pkg' is not installed."
-        exit 1
+        log "Package '$pkg' is not installed. Will install lagged version."
+        is_new_install=true
+        current_ver="(not installed)"
     fi
     
     log "Checking $pkg..."
@@ -404,7 +440,7 @@ check_single_package() {
         warn "Package not found in global plan. Running isolated check (riskier for dependencies)..."
         local repo_head=$(git -C "$BREW_REPO" rev-parse HEAD)
         local result=$(get_formula_target "$pkg" "$current_ver" "$BREW_REPO" "1" "1" "$CACHE_FILE" "$repo_head")
-        IFS='|' read -r formula current target hash path <<< "$result"
+        IFS='|' read -r formula current target hash path target_ts <<< "$result"
     fi
     
     # Format target string with commit hash if available
@@ -426,6 +462,10 @@ check_single_package() {
     if [ -z "$target" ] || [ -z "$hash" ]; then
          action="ERR:NoHistory"
          color="$RED"
+    elif [ "$is_new_install" = true ]; then
+         action="NEW_INSTALL"
+         color="$BLUE"
+         do_change=true
     elif [ "$current" == "$target" ]; then
          action="OK"
          color="$GREEN"
@@ -454,17 +494,65 @@ check_single_package() {
             local tap_rb="$TAP_PATH/Formula/$formula.rb"
             git -C "$BREW_REPO" show "$hash:$path" > "$tap_rb"
             
-            # Must uninstall to switch tap
-            brew uninstall --ignore-dependencies "$formula" < /dev/null &>/dev/null || true
-            
-            if out=$(brew install --ignore-dependencies --formula "$EXPORT_TAP/$formula" < /dev/null 2>&1); then
-                brew pin "$formula" &>/dev/null
-                success "Success."
+            # For new installs, we need to handle pinned dependencies
+            if [ "$is_new_install" = true ]; then
+                # Get list of currently pinned packages
+                local pinned_list=$(brew list --pinned 2>/dev/null | tr '\n' ' ')
+                
+                if [ -n "$pinned_list" ]; then
+                    log "Temporarily unpinning dependencies: $pinned_list"
+                    brew unpin $pinned_list </dev/null &>/dev/null || true
+                fi
+                
+                # Uninstall packages from local tap that might conflict with dependency resolution
+                # Homebrew won't upgrade packages already installed from a different tap
+                # We check INSTALL_RECEIPT.json in Cellar since brew info shows formula source, not install source
+                local cellar_path=$(brew --cellar)
+                local local_tap_pkgs=""
+                for pkg in $(brew list --formula 2>/dev/null); do
+                    # Find the installed version directory
+                    local pkg_path=$(find "$cellar_path/$pkg" -maxdepth 1 -type d 2>/dev/null | tail -1)
+                    if [ -f "$pkg_path/INSTALL_RECEIPT.json" ]; then
+                        local installed_tap=$(jq -r '.source.tap // empty' "$pkg_path/INSTALL_RECEIPT.json" 2>/dev/null)
+                        if [ "$installed_tap" == "$EXPORT_TAP" ]; then
+                            local_tap_pkgs="$local_tap_pkgs $pkg"
+                        fi
+                    fi
+                done
+                local_tap_pkgs=$(echo "$local_tap_pkgs" | xargs)  # Trim whitespace
+                
+                if [ -n "$local_tap_pkgs" ]; then
+                    log "Uninstalling local tap packages to allow dependency resolution: $local_tap_pkgs"
+                    brew uninstall --ignore-dependencies $local_tap_pkgs </dev/null &>/dev/null || true
+                fi
+                
+                # Install from local tap (lagged version)
+                if out=$(brew install --formula "$EXPORT_TAP/$formula" </dev/null 2>&1); then
+                    brew pin "$formula" &>/dev/null
+                    success "Success."
+                else
+                    error "Failed."
+                    echo "$out" | sed 's/^/   /'
+                fi
+                
+                # Re-pin everything that was pinned before (some may have been reinstalled)
+                if [ -n "$pinned_list" ]; then
+                    log "Re-pinning: $pinned_list"
+                    brew pin $pinned_list </dev/null &>/dev/null || true
+                fi
             else
-                error "Failed."
-                echo "$out" | sed 's/^/   /'
-                log "Restoring original..."
-                brew install "$formula" < /dev/null &>/dev/null
+                # Existing package - must uninstall to switch tap
+                brew uninstall --ignore-dependencies "$formula" </dev/null &>/dev/null || true
+                
+                if out=$(brew install --ignore-dependencies --formula "$EXPORT_TAP/$formula" </dev/null 2>&1); then
+                    brew pin "$formula" &>/dev/null
+                    success "Success."
+                else
+                    error "Failed."
+                    echo "$out" | sed 's/^/   /'
+                    log "Restoring original..."
+                    brew install "$formula" </dev/null &>/dev/null
+                fi
             fi
             rm -f "$tap_rb"
         else
@@ -769,6 +857,9 @@ while [[ "$#" -gt 0 ]]; do
         list)
             COMMAND="list"
             shift ;;
+        upgrade-excluded)
+            COMMAND="upgrade-excluded"
+            shift ;;
         -j|--jobs)
             if [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ]; then
                 PARALLEL_JOBS="$2"
@@ -792,6 +883,7 @@ case "$COMMAND" in
     exclude)  add_exception "$PKG_ARG" ;;
     include)  remove_exception "$PKG_ARG" ;;
     list)     list_exceptions ;;
+    upgrade-excluded) upgrade_excluded ;;
     plan)     run_analysis ;;
     apply)    execute_plan ;;
     install)  check_single_package "$PKG_ARG" ;;
